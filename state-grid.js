@@ -372,12 +372,33 @@ const notify = (e = '', o = '', r = '', s = {}) => {
   },
   SERVER_HOST = 'https://api.120399.xyz',
   BASE_URL = 'https://www.95598.cn',
+  GATEWAY_HEADERS = {
+    'Content-Type': 'application/json;charset=UTF-8',
+    Accept: 'application/json;charset=UTF-8',
+    version: '1.0',
+    source: '0901',
+    wsgwType: 'web',
+  },
+  LOGIN_PAGE_URL = 'https://www.95598.cn/osgweb/login',
+  buildGatewayHeaders = (headers = {}) => {
+    const riskHeaders = Global.riskContext?.deviceToken
+      ? { deviceTokenTX: Global.riskContext.deviceToken }
+      : {};
+    return {
+      ...GATEWAY_HEADERS,
+      ...headers,
+      ...riskHeaders,
+      timestamp: headers.timestamp || Date.now(),
+    };
+  },
   request = async e => {
     try {
       const o = {
-        url: `${SERVER_HOST}/wsgw/encrypt`,
+        url: `${SERVER_HOST}/wsgw/s1`,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ yuheng: e }),
+        body: JSON.stringify({
+          yuheng: { ...e, headers: buildGatewayHeaders(e.headers) },
+        }),
       },
         r = await Encrypt(o);
       switch (e.url) {
@@ -404,7 +425,7 @@ const notify = (e = '', o = '', r = '', s = {}) => {
       if ('/api/oauth2/outer/c02/f02' === e.url)
         Object.assign(n.config, { headers: { encryptKey: r.encryptKey } });
       const t = {
-        url: `${SERVER_HOST}/wsgw/decrypt`,
+        url: `${SERVER_HOST}/wsgw/s2`,
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ yuheng: n }),
       };
@@ -454,6 +475,36 @@ const notify = (e = '', o = '', r = '', s = {}) => {
       body: JSON.stringify({ yuheng: e }),
     };
     return request$1(o).then(({ body: e }) => JSON.parse(e));
+  },
+  initRiskCtx = async () => {
+    const o = {
+      url: `${SERVER_HOST}/wsgw/s4`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        yuheng: {
+          ua:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+          href: LOGIN_PAGE_URL,
+          referer: LOGIN_PAGE_URL,
+          ip: '',
+        },
+      }),
+    };
+    return request$1(o).then(({ body: e }) => {
+      try {
+        e = JSON.parse(e);
+      } catch {
+        return Promise.reject(`风控初始化返回异常: ${String(e).slice(0, 200)}`);
+      }
+      const t = e?.data || e;
+      Global.riskContext = {
+        deviceToken: t?.tdcItoken || t?.deviceToken || '',
+        tdcItoken: t?.tdcItoken || '',
+        collect: t?.collect || '',
+        info: t?.info || null,
+      };
+      return Global.riskContext;
+    });
   },
   getBeforeDate = e => {
     const o = new Date();
@@ -1263,6 +1314,7 @@ const notify = (e = '', o = '', r = '', s = {}) => {
             ? self
             : {};
 Global.bizrt = jsonParse(store.get('95598_bizrt')) || {};
+Global.riskContext = {};
 const log = new Logger(
   SCRIPTNAME,
   isTrue(isNode() ? process.env.WSGW_LOG_DEBUG : store.get('95598_log_debug'))
@@ -1322,35 +1374,52 @@ async function getVerifyCode() {
     console.log('🔚 获取验证码结束');
   }
 }
-async function login(e, o) {
+function getLoginPayload(username, password, slider = null) {
+  return {
+    params: {
+      uscInfo: {
+        devciceIp: '',
+        tenant: 'state_grid',
+        member: '0902',
+        devciceId: '',
+      },
+      quInfo: {
+        optSys: 'android',
+        pushId: '000000',
+        addressProvince: '110100',
+        password,
+        addressRegion: '110101',
+        account: username,
+        addressCity: '330100',
+      },
+    },
+    complexSliderRet: slider ? slider.complexSliderRet : void 0,
+    complexSliderType: slider ? slider.complexSliderType : void 0,
+  };
+}
+function getCaptchaType(error) {
+  const msg = String(error);
+  if (/RK1003/.test(msg)) return 'clickImg';
+  if (/RK008/.test(msg)) return 'clickWord';
+  return 'blockPuzzle';
+}
+function isCaptchaChallenge(error) {
+  return /RK007|RK008|RK1003/.test(String(error));
+}
+function isRateLimited(error) {
+  return /操作过于频繁|code["']?\s*[:=]\s*-?100\b/.test(String(error));
+}
+function isLoginRiskBlocked(error) {
+  return /RK001|网络连接超时/.test(String(error));
+}
+async function login(slider = null) {
   console.log('⏳ 登录中...');
   try {
     const r = {
       url: `/api${$api.loginTestCodeNew}`,
       method: 'post',
       headers: { ...requestKey },
-      data: {
-        loginKey: e,
-        code: o,
-        params: {
-          uscInfo: {
-            devciceIp: '',
-            tenant: 'state_grid',
-            member: '0902',
-            devciceId: '',
-          },
-          quInfo: {
-            optSys: 'android',
-            pushId: '000000',
-            addressProvince: '110100',
-            password: PASSWORD,
-            addressRegion: '110101',
-            account: USERNAME,
-            addressCity: '330100',
-          },
-        },
-        Channels: 'web',
-      },
+      data: getLoginPayload(USERNAME, PASSWORD, slider),
     },
       { bizrt: s } = await request(r);
     if (!(s?.userInfo?.length > 0))
@@ -1363,9 +1432,29 @@ async function login(e, o) {
         `👤 用户信息: ${s.userInfo[0].nickname || s.userInfo[0].loginAccount}`
       );
   } catch (e) {
-    return /验证错误/.test(e)
-      ? (log.error(`滑块验证出错, 重新登录: ${e}`), await doLogin())
-      : Promise.reject(`登陆失败: ${e}`);
+    if (isRateLimited(e))
+      return Promise.reject(`登录过于频繁，请稍后再试: ${e}`);
+    if (isLoginRiskBlocked(e))
+      return Promise.reject(
+        [
+          '账号触发登录风控，请次日再次尝试。',
+          '可能原因：',
+          '1. 账号或密码填写有误',
+          '2. 验证码校验次数过多',
+          '3. 登录次数过多',
+          '建议处理：',
+          '1. 先打开“网上国网”App，或登录 https://www.95598.cn/ 手动确认账号密码是否正确。',
+          '2. 如果手动登录也失败，请先修正账号信息后再运行脚本。',
+          '3. 如果手动登录正常，建议今天不要继续频繁重试，等待明天再试。',
+          `原始返回: ${e}`,
+        ].join('\n')
+      );
+    if (isCaptchaChallenge(e) && !slider) {
+      const sliderType = getCaptchaType(e);
+      log.warn(`命中风控校验，尝试占位重试: ${sliderType}`);
+      return login({ complexSliderRet: 0, complexSliderType: sliderType });
+    }
+    return Promise.reject(`登陆失败: ${e}`);
   } finally {
     console.log('🔚 登录结束');
   }
@@ -1613,8 +1702,10 @@ async function getMonthElecQuantity(e) {
   }
 }
 async function doLogin() {
-  const { code: e, ticket: o } = await getVerifyCode();
-  await login(o, e);
+  await initRiskCtx().catch(e => {
+    log.warn(`风控初始化失败，将继续尝试登录: ${e}`);
+  });
+  await login();
 }
 async function showNotice() {
   // console.log(''),
